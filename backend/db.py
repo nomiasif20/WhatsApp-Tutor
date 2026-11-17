@@ -1,0 +1,760 @@
+"""Local database for people, trained passages, progress, and papers."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data"
+DB_PATH = DATA / "tutor.db"
+MATERIAL = ROOT / "Material"
+UPLOADS = DATA / "uploads"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS people (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL,
+    grade INTEGER,
+    parent_id TEXT,
+    username TEXT,
+    password_hash TEXT,
+    phone TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY,
+    filename TEXT NOT NULL,
+    stored_path TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    grade INTEGER,
+    title TEXT NOT NULL,
+    pages INTEGER NOT NULL DEFAULT 0,
+    chunk_count INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT,
+    file_kind TEXT NOT NULL,
+    trained_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    page INTEGER NOT NULL,
+    grade INTEGER,
+    text TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS questions (
+    id INTEGER PRIMARY KEY,
+    student_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    topic_id TEXT,
+    topic_name TEXT,
+    term INTEGER,
+    attachment TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS practice_items (
+    id INTEGER PRIMARY KEY,
+    student_id TEXT NOT NULL,
+    topic_id TEXT NOT NULL,
+    topic_name TEXT NOT NULL,
+    term INTEGER,
+    prompt TEXT NOT NULL,
+    accept_json TEXT NOT NULL,
+    steps_json TEXT NOT NULL,
+    answer_text TEXT NOT NULL,
+    answered INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY,
+    student_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    topic_id TEXT,
+    topic_name TEXT,
+    term INTEGER,
+    correct INTEGER,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS exam_results (
+    id INTEGER PRIMARY KEY,
+    student_id TEXT NOT NULL,
+    paper_id TEXT NOT NULL,
+    grade INTEGER NOT NULL,
+    term INTEGER NOT NULL,
+    score INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    detail_json TEXT NOT NULL,
+    submitted_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY,
+    student_id TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    body TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_state (
+    student_id TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS whatsapp_seen (
+    message_id TEXT PRIMARY KEY,
+    received_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
+CREATE INDEX IF NOT EXISTS idx_chat_student ON chat_messages(student_id, id);
+CREATE INDEX IF NOT EXISTS idx_activity_student ON activity(student_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_questions_student ON questions(student_id, created_at);
+"""
+
+
+def connect() -> sqlite3.Connection:
+    DATA.mkdir(parents=True, exist_ok=True)
+    UPLOADS.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ago(days: int, hours: int = 9) -> str:
+    return (datetime.now() - timedelta(days=days, hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def init_db() -> None:
+    with connect() as conn:
+        conn.executescript(SCHEMA)
+        _migrate_people(conn)
+        count = conn.execute("SELECT COUNT(*) AS n FROM people").fetchone()["n"]
+        if count == 0:
+            _seed(conn)
+        _ensure_accounts(conn)
+        conn.commit()
+
+
+def _migrate_people(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(people)")}
+    if "username" not in columns:
+        conn.execute("ALTER TABLE people ADD COLUMN username TEXT")
+    if "password_hash" not in columns:
+        conn.execute("ALTER TABLE people ADD COLUMN password_hash TEXT")
+    if "active" not in columns:
+        conn.execute("ALTER TABLE people ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    if "created_at" not in columns:
+        conn.execute("ALTER TABLE people ADD COLUMN created_at TEXT")
+    if "phone" not in columns:
+        conn.execute("ALTER TABLE people ADD COLUMN phone TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            person_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_people_username ON people(username)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_people_phone ON people(phone) WHERE phone IS NOT NULL AND phone != ''"
+    )
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000)
+    return f"{salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str | None) -> bool:
+    if not stored or "$" not in stored:
+        return False
+    salt, digest = stored.split("$", 1)
+    check = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000).hex()
+    return secrets.compare_digest(check, digest)
+
+
+def public_person(row: dict) -> dict:
+    data = dict(row)
+    data.pop("password_hash", None)
+    return data
+
+
+def normalise_phone(value: str) -> str:
+    digits = re.sub(r"\D", "", value or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if len(digits) == 10 and digits.startswith("0"):
+        digits = "27" + digits[1:]
+    if not re.fullmatch(r"[1-9]\d{9,14}", digits):
+        raise ValueError("Enter the WhatsApp number with the country code, for example 27821234567.")
+    return digits
+
+
+_SETTING_ENV = {
+    "whatsapp_token": "WHATSAPP_TOKEN",
+    "whatsapp_phone_id": "WHATSAPP_PHONE_NUMBER_ID",
+    "whatsapp_verify_token": "WHATSAPP_VERIFY_TOKEN",
+    "whatsapp_app_secret": "WHATSAPP_APP_SECRET",
+    "grok_api_key": "XAI_API_KEY",
+}
+
+
+def setting(conn, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if row and str(row["value"]).strip():
+        return str(row["value"]).strip()
+    env = os.environ.get(_SETTING_ENV.get(key, ""), "").strip()
+    return env or default
+
+
+def save_setting(conn, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+
+
+def _ensure_accounts(conn: sqlite3.Connection) -> None:
+    """Give existing desks a sign-in, without changing a password that was already set."""
+    starters = [
+        ("s1", "amahle", "amahle"),
+        ("s2", "sipho", "sipho"),
+        ("s3", "hannah", "hannah"),
+        ("t1", "naledi", "naledi"),
+        ("p1", "kabelo", "kabelo"),
+        ("p2", "lindiwe", "lindiwe"),
+        ("p3", "pieter", "pieter"),
+    ]
+    for person_id, username, password in starters:
+        row = conn.execute("SELECT id, password_hash FROM people WHERE id = ?", (person_id,)).fetchone()
+        if row and not row["password_hash"]:
+            conn.execute(
+                """
+                UPDATE people
+                   SET username = ?, password_hash = ?, active = 1,
+                       created_at = COALESCE(created_at, ?)
+                 WHERE id = ?
+                """,
+                (username, hash_password(password), now(), person_id),
+            )
+    admin = conn.execute("SELECT id FROM people WHERE username = 'admin'").fetchone()
+    if not admin:
+        conn.execute(
+            """
+            INSERT INTO people
+                (id, name, role, grade, parent_id, username, password_hash, active, created_at)
+            VALUES ('admin', 'Administrator', 'admin', NULL, NULL, 'admin', ?, 1, ?)
+            """,
+            (hash_password("admin"), now()),
+        )
+
+
+def _seed(conn: sqlite3.Connection) -> None:
+    people = [
+        ("s1", "Amahle Mokoena", "student", 8, "p1"),
+        ("s2", "Sipho Dlamini", "student", 9, "p2"),
+        ("s3", "Hannah Botha", "student", 7, "p3"),
+        ("t1", "Naledi Khumalo", "teacher", None, None),
+        ("p1", "Kabelo Mokoena", "parent", None, None),
+        ("p2", "Lindiwe Dlamini", "parent", None, None),
+        ("p3", "Pieter Botha", "parent", None, None),
+    ]
+    conn.executemany(
+        "INSERT INTO people (id, name, role, grade, parent_id) VALUES (?, ?, ?, ?, ?)",
+        people,
+    )
+    activities = []
+
+    def add(student, kind, topic_id, name, term, correct, days):
+        activities.append((student, kind, topic_id, name, term, correct, ago(days)))
+
+    for offset in (12, 11, 10):
+        add("s1", "practice", "g8-whole_numbers", "Whole numbers", 1, 1, offset)
+    for offset, correct in ((9, 1), (9, 1), (8, 1), (8, 0), (8, 1)):
+        add("s1", "practice", "g8-integers", "Integers", 1, correct, offset)
+    for offset, correct in ((5, 1), (4, 0), (4, 1), (3, 0)):
+        add("s1", "practice", "g8-exponents", "Exponents", 1, correct, offset)
+    add("s1", "question", "g8-integers", "Integers", 1, None, 2)
+    add("s1", "question", "g8-exponents", "Exponents", 1, None, 1)
+
+    for offset, correct in ((6, 1), (5, 0), (4, 0), (3, 1), (2, 0)):
+        add("s2", "practice", "g9-expressions", "Algebraic expressions", 2, correct, offset)
+    for offset, correct in ((6, 1), (5, 1), (4, 1), (3, 1), (2, 0), (1, 1)):
+        add("s2", "practice", "g9-equations", "Algebraic equations", 2, correct, offset)
+    add("s2", "question", "g9-equations", "Algebraic equations", 2, None, 1)
+
+    for offset, correct in ((6, 0), (5, 1), (4, 0), (3, 1), (2, 0)):
+        add("s3", "practice", "g7-fractions", "Common fractions", 2, correct, offset)
+    for offset in (7, 6, 5, 4):
+        add("s3", "practice", "g7-whole_numbers", "Whole numbers", 1, 1, offset)
+    add("s3", "question", "g7-fractions", "Common fractions", 2, None, 3)
+
+    conn.executemany(
+        """
+        INSERT INTO activity (student_id, kind, topic_id, topic_name, term, correct, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        activities,
+    )
+    conn.executemany(
+        """
+        INSERT INTO exam_results
+            (student_id, paper_id, grade, term, score, total, detail_json, submitted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("s1", "g8-t1", 8, 1, 36, 50, "[]", ago(20)),
+            ("s2", "g9-t1", 9, 1, 41, 50, "[]", ago(15)),
+        ],
+    )
+    conn.executemany(
+        """
+        INSERT INTO questions (student_id, body, topic_id, topic_name, term, attachment, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("s1", "Calculate −12 + 7 − 4.", "g8-integers", "Integers", 1, None, ago(2)),
+            ("s1", "What is 12 squared?", "g8-exponents", "Exponents", 1, None, ago(1)),
+            ("s2", "Solve 3x − 4 = 11.", "g9-equations", "Algebraic equations", 2, None, ago(1)),
+            ("s3", "Calculate 1/2 + 1/3.", "g7-fractions", "Common fractions", 2, None, ago(3)),
+        ],
+    )
+
+
+def person(conn, person_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM people WHERE id = ?", (person_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def authenticate(conn, username: str, password: str) -> tuple[str, dict | None]:
+    row = conn.execute(
+        "SELECT * FROM people WHERE username = ?",
+        (username.strip().lower(),),
+    ).fetchone()
+    if not row or not verify_password(password, row["password_hash"]):
+        return "invalid", None
+    found = dict(row)
+    if not found.get("active", 1):
+        return "inactive", None
+    return "ok", found
+
+
+def open_session(conn, person_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        "INSERT INTO sessions (token, person_id, created_at) VALUES (?, ?, ?)",
+        (token, person_id, now()),
+    )
+    return token
+
+
+def person_for_token(conn, token: str) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT p.*
+          FROM sessions s
+          JOIN people p ON p.id = s.person_id
+         WHERE s.token = ?
+        """,
+        (token,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def close_session(conn, token: str) -> None:
+    conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+
+
+def list_users(conn) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT p.id, p.name, p.role, p.grade, p.parent_id, p.username, p.phone, p.active, p.created_at,
+               parent.name AS parent_name
+          FROM people p
+          LEFT JOIN people parent ON parent.id = p.parent_id
+         ORDER BY
+            CASE p.role WHEN 'admin' THEN 0 WHEN 'teacher' THEN 1 WHEN 'parent' THEN 2 ELSE 3 END,
+            p.name
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_user(conn, *, name: str, username: str, password: str, role: str,
+                grade: int | None, parent_id: str | None, phone: str | None = None) -> dict:
+    taken = conn.execute("SELECT id FROM people WHERE username = ?", (username,)).fetchone()
+    if taken:
+        raise ValueError("That username is already in use.")
+    if parent_id:
+        parent = conn.execute(
+            "SELECT id FROM people WHERE id = ? AND role = 'parent' AND active = 1",
+            (parent_id,),
+        ).fetchone()
+        if not parent:
+            raise ValueError("Choose an active parent account.")
+    if phone and role != "student":
+        phone = None
+    if phone:
+        taken_phone = conn.execute("SELECT id FROM people WHERE phone = ?", (phone,)).fetchone()
+        if taken_phone:
+            raise ValueError("That WhatsApp number is already linked to another account.")
+    user_id = secrets.token_hex(8)
+    conn.execute(
+        """
+        INSERT INTO people
+            (id, name, role, grade, parent_id, username, password_hash, phone, active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        """,
+        (user_id, name, role, grade, parent_id, username, hash_password(password), phone, now()),
+    )
+    return public_person(person(conn, user_id))
+
+
+def update_user(conn, user_id: str, *, actor_id: str, name: str | None, grade: int | None,
+                parent_id: str | None, clear_parent: bool, active: int | None, password: str | None,
+                phone: str | None = None, set_phone: bool = False) -> dict:
+    current = person(conn, user_id)
+    if not current:
+        raise ValueError("That account does not exist.")
+    if active == 0 and user_id == actor_id:
+        raise ValueError("You cannot deactivate the account you are using.")
+    if active == 0 and current["role"] == "admin":
+        others = conn.execute(
+            "SELECT COUNT(*) AS n FROM people WHERE role = 'admin' AND active = 1 AND id != ?",
+            (user_id,),
+        ).fetchone()["n"]
+        if others == 0:
+            raise ValueError("There must be at least one active administrator.")
+    if parent_id:
+        parent = conn.execute(
+            "SELECT id FROM people WHERE id = ? AND role = 'parent'",
+            (parent_id,),
+        ).fetchone()
+        if not parent:
+            raise ValueError("Choose a parent account.")
+    fields = []
+    values = []
+    if name is not None:
+        fields.append("name = ?")
+        values.append(name)
+    if current["role"] == "student" and grade is not None:
+        fields.append("grade = ?")
+        values.append(grade)
+    if current["role"] == "student" and clear_parent:
+        fields.append("parent_id = NULL")
+    elif current["role"] == "student" and parent_id:
+        fields.append("parent_id = ?")
+        values.append(parent_id)
+    if active is not None:
+        fields.append("active = ?")
+        values.append(active)
+    if password:
+        fields.append("password_hash = ?")
+        values.append(hash_password(password))
+    if set_phone and current["role"] == "student":
+        if phone:
+            taken_phone = conn.execute(
+                "SELECT id FROM people WHERE phone = ? AND id != ?",
+                (phone, user_id),
+            ).fetchone()
+            if taken_phone:
+                raise ValueError("That WhatsApp number is already linked to another account.")
+            fields.append("phone = ?")
+            values.append(phone)
+        else:
+            fields.append("phone = NULL")
+    if fields:
+        values.append(user_id)
+        conn.execute(f"UPDATE people SET {', '.join(fields)} WHERE id = ?", values)
+    updated = person(conn, user_id)
+    return public_person(updated)
+
+
+def children_of(conn, parent_id: str) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT id, name, role, grade, parent_id, username, active
+          FROM people
+         WHERE role = 'student' AND parent_id = ?
+         ORDER BY name
+        """,
+        (parent_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def log_activity(conn, student_id, kind, topic_id, topic_name, term, correct) -> None:
+    conn.execute(
+        """
+        INSERT INTO activity (student_id, kind, topic_id, topic_name, term, correct, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (student_id, kind, topic_id, topic_name, term, correct, now()),
+    )
+
+
+def save_question(conn, student_id, body, topic_id, topic_name, term, attachment) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO questions (student_id, body, topic_id, topic_name, term, attachment, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (student_id, body, topic_id, topic_name, term, attachment, now()),
+    )
+    return cursor.lastrowid
+
+
+def save_practice(conn, student_id, topic, items: list[dict]) -> list[dict]:
+    saved = []
+    for item in items:
+        cursor = conn.execute(
+            """
+            INSERT INTO practice_items
+                (student_id, topic_id, topic_name, term, prompt, accept_json, steps_json, answer_text, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                student_id,
+                topic["id"],
+                topic["name"],
+                topic.get("term"),
+                item["prompt"],
+                json.dumps(item["accept"]),
+                json.dumps(item["steps"]),
+                item["answer"],
+                now(),
+            ),
+        )
+        saved.append({"id": cursor.lastrowid, "prompt": item["prompt"]})
+    return saved
+
+
+def progress_for(conn, student: dict, include_questions: bool = False) -> dict:
+    student_id = student["id"]
+    grade = student["grade"]
+    week_start = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    topic_rows = conn.execute(
+        """
+        SELECT topic_id, topic_name, term,
+               COUNT(*) AS attempted,
+               SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS correct
+          FROM activity
+         WHERE student_id = ? AND correct IS NOT NULL
+         GROUP BY topic_id, topic_name, term
+        """,
+        (student_id,),
+    ).fetchall()
+    by_topic = {row["topic_id"]: dict(row) for row in topic_rows}
+    from curriculum import PLACEMENT, NAMES, topic_id
+
+    terms = []
+    focus_pool = []
+    for term in (1, 2, 3, 4):
+        topics = []
+        for concept in PLACEMENT[grade][term]:
+            tid = topic_id(grade, concept)
+            stats = by_topic.get(tid, {})
+            attempted = stats.get("attempted") or 0
+            correct = stats.get("correct") or 0
+            accuracy = (correct / attempted) if attempted else None
+            topics.append({
+                "id": tid,
+                "concept": concept,
+                "name": NAMES[concept],
+                "term": term,
+                "attempted": attempted,
+                "correct": correct,
+                "accuracy": accuracy,
+            })
+            focus_pool.append(topics[-1])
+        terms.append({"term": term, "topics": topics})
+
+    weak = [item for item in focus_pool if item["attempted"] >= 2 and (item["accuracy"] or 0) < 0.6]
+    weak.sort(key=lambda item: (item["accuracy"], -item["attempted"]))
+    if len(weak) < 2:
+        current = [item for item in focus_pool if item["term"] == 4 and item["attempted"] == 0]
+        weak.extend(current)
+    focus = []
+    for item in weak:
+        if any(existing["id"] == item["id"] for existing in focus):
+            continue
+        if item["attempted"] == 0:
+            reason = "Not practised yet this year."
+        else:
+            reason = f"{item['correct']} correct out of {item['attempted']}."
+        focus.append({**item, "reason": reason})
+        if len(focus) == 2:
+            break
+
+    week_questions = conn.execute(
+        "SELECT COUNT(*) AS n FROM activity WHERE student_id = ? AND kind = 'question' AND created_at >= ?",
+        (student_id, week_start),
+    ).fetchone()["n"]
+    week_scored = conn.execute(
+        """
+        SELECT COUNT(*) AS n, SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS correct
+          FROM activity
+         WHERE student_id = ? AND correct IS NOT NULL AND created_at >= ?
+        """,
+        (student_id, week_start),
+    ).fetchone()
+    scored_n = week_scored["n"] or 0
+    scored_correct = week_scored["correct"] or 0
+    recent = _recent(conn, student_id)
+    exams = exam_list(conn, student_id, grade)
+    questions = []
+    if include_questions:
+        question_rows = conn.execute(
+            """
+            SELECT id, body, topic_name, term, created_at
+              FROM questions
+             WHERE student_id = ?
+             ORDER BY id DESC
+             LIMIT 6
+            """,
+            (student_id,),
+        ).fetchall()
+        questions = [dict(row) for row in question_rows]
+    return {
+        "student": {"id": student_id, "name": student["name"], "grade": grade},
+        "week": {
+            "questions": week_questions,
+            "practised": scored_n,
+            "correct": scored_correct,
+            "accuracy": (scored_correct / scored_n) if scored_n else None,
+        },
+        "terms": terms,
+        "focus": focus,
+        "recent": recent,
+        "exams": exams,
+        "questions": questions,
+    }
+
+
+def _recent(conn, student_id: str) -> list[dict]:
+    items = []
+    rows = conn.execute(
+        """
+        SELECT kind, topic_name, term, correct, created_at
+          FROM activity
+         WHERE student_id = ?
+         ORDER BY created_at DESC
+         LIMIT 12
+        """,
+        (student_id,),
+    ).fetchall()
+    for row in rows:
+        if row["kind"] == "exam":
+            continue
+        items.append(dict(row))
+    exams = conn.execute(
+        """
+        SELECT term, score, total, submitted_at
+          FROM exam_results
+         WHERE student_id = ?
+         ORDER BY submitted_at DESC
+        """,
+        (student_id,),
+    ).fetchall()
+    for row in exams:
+        items.append({
+            "kind": "paper",
+            "topic_name": f"Term {row['term']} paper",
+            "term": row["term"],
+            "correct": None,
+            "score": row["score"],
+            "total": row["total"],
+            "created_at": row["submitted_at"],
+        })
+    items.sort(key=lambda item: item["created_at"], reverse=True)
+    return items[:10]
+
+
+def exam_list(conn, student_id: str, grade: int) -> list[dict]:
+    results = conn.execute(
+        """
+        SELECT paper_id, score, total, submitted_at
+          FROM exam_results
+         WHERE student_id = ?
+         ORDER BY submitted_at DESC
+        """,
+        (student_id,),
+    ).fetchall()
+    latest = {}
+    for row in results:
+        latest.setdefault(row["paper_id"], dict(row))
+    papers = []
+    for term in (1, 2, 3, 4):
+        paper_id = f"g{grade}-t{term}"
+        found = latest.get(paper_id)
+        papers.append({
+            "id": paper_id,
+            "grade": grade,
+            "term": term,
+            "total": 50,
+            "minutes": 60,
+            "score": found["score"] if found else None,
+            "submitted_at": found["submitted_at"] if found else None,
+        })
+    return papers
+
+
+def class_overview(conn) -> list[dict]:
+    students = conn.execute(
+        "SELECT * FROM people WHERE role = 'student' ORDER BY grade, name"
+    ).fetchall()
+    overview = []
+    for student in students:
+        report = progress_for(conn, dict(student))
+        parent = person(conn, student["parent_id"])
+        overview.append({
+            "id": student["id"],
+            "name": student["name"],
+            "grade": student["grade"],
+            "parent": parent["name"] if parent else None,
+            "week": report["week"],
+            "focus": report["focus"],
+            "exams": report["exams"],
+            "terms": report["terms"],
+            "recent": report["recent"],
+        })
+    return overview

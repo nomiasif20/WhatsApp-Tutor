@@ -1,0 +1,10 @@
+Material/*.pdf
+node_modules/
+frontend/dist/
+__pycache__/
+*.pyc
+data/
+*.db
+.env
+.venv/
+venv/
