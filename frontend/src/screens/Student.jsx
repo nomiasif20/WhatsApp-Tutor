@@ -101,7 +101,10 @@ function WhatsApp({ onPractised }) {
   const [text, setText] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [earlier, setEarlier] = useState(0);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const scroller = useRef(null);
+  const openedEarlier = useRef(false);
 
   useEffect(() => {
     let stop = false;
@@ -109,8 +112,9 @@ function WhatsApp({ onPractised }) {
       api("/api/chat")
         .then((data) => {
           if (stop) return;
-          setMessages(data.messages);
+          setMessages((current) => mergeMessages(current, data.messages));
           setPhone(data.phone || "");
+          if (!openedEarlier.current) setEarlier(data.earlier || 0);
         })
         .catch((err) => {
           if (!stop) setError(err.message);
@@ -124,9 +128,30 @@ function WhatsApp({ onPractised }) {
     };
   }, []);
 
+  const lastId = messages?.[messages.length - 1]?.id;
   useEffect(() => {
     if (scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight;
-  }, [messages]);
+  }, [lastId]);
+
+  async function loadEarlier() {
+    if (!messages?.length || loadingEarlier) return;
+    const pane = scroller.current;
+    const beforeHeight = pane ? pane.scrollHeight : 0;
+    setLoadingEarlier(true);
+    openedEarlier.current = true;
+    try {
+      const data = await api(`/api/chat?before=${messages[0].id}`);
+      setMessages((current) => mergeMessages(data.messages, current));
+      setEarlier(data.earlier || 0);
+      requestAnimationFrame(() => {
+        if (pane) pane.scrollTop = pane.scrollHeight - beforeHeight;
+      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }
 
   async function send(event) {
     event.preventDefault();
@@ -137,7 +162,8 @@ function WhatsApp({ onPractised }) {
     setText("");
     try {
       const data = await api("/api/chat", { method: "POST", json: { text: body } });
-      setMessages(data.messages);
+      setMessages((current) => mergeMessages(current, data.messages));
+      setEarlier(data.earlier || 0);
       onPractised();
     } catch (err) {
       setError(err.message);
@@ -154,18 +180,23 @@ function WhatsApp({ onPractised }) {
         <h1>WhatsApp</h1>
         <p className="lede">
           {phone
-            ? `This chat is linked to +${phone}. A message on that WhatsApp number gets the same reply.`
-            : "Chat here now. An administrator can add a WhatsApp number so the same replies arrive on the phone."}
+            ? `This chat is linked to +${phone}. A question on that WhatsApp number is saved here and answered on the phone.`
+            : "This chat keeps the conversation. An administrator can add a WhatsApp number so a question from the phone is saved here too."}
         </p>
       </div>
       <div className="thread" ref={scroller}>
+        {earlier > 0 ? (
+          <button className="quiet earlier" type="button" onClick={loadEarlier} disabled={loadingEarlier}>
+            {loadingEarlier ? "Loading…" : "Earlier messages"}
+          </button>
+        ) : null}
         {messages && messages.length === 0 ? (
           <p className="meta">Send a question, or reply help. You can also send progress or paper.</p>
         ) : null}
         {(messages || []).map((message) => (
           <div key={message.id} className={message.direction === "in" ? "bubble mine" : "bubble theirs"}>
             <span>{message.body}</span>
-            {message.source === "whatsapp" ? <small>WhatsApp</small> : null}
+            <small>{message.source === "whatsapp" ? "WhatsApp · " : ""}{chatWhen(message.created_at)}</small>
           </div>
         ))}
         {!messages ? <p className="meta">Loading the chat…</p> : null}
@@ -181,6 +212,19 @@ function WhatsApp({ onPractised }) {
       {error ? <p className="bad">{error}</p> : null}
     </div>
   );
+}
+
+function mergeMessages(current, incoming) {
+  const byId = new Map((current || []).map((message) => [message.id, message]));
+  for (const message of incoming || []) byId.set(message.id, message);
+  return [...byId.values()].sort((a, b) => a.id - b.id);
+}
+
+function chatWhen(value) {
+  if (!value) return "";
+  const date = new Date(String(value).replace(" ", "T"));
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("en-ZA", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 function Lesson({ data, onConcept, onPractised }) {

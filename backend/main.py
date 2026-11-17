@@ -80,7 +80,7 @@ def health():
     with db.connect() as conn:
         documents = conn.execute("SELECT COUNT(*) AS n FROM documents").fetchone()["n"]
         chunks = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"]
-    return {"ok": True, "documents": documents, "passages": chunks}
+    return {"ok": True, "database": "Whatsapp Tutor", "documents": documents, "passages": chunks}
 
 
 @app.get("/api/whatsapp")
@@ -126,9 +126,12 @@ async def whatsapp_inbound(request: Request):
 
 @app.get("/api/chat")
 def chat_thread(request: Request):
+    raw = request.query_params.get("before")
+    before = int(raw) if raw and raw.isdigit() else None
     with db.connect() as conn:
         student = require_person(request, conn, "student")
-        return {"phone": student.get("phone"), "messages": chat.history(conn, student["id"])}
+        messages, earlier = chat.history_page(conn, student["id"], before=before)
+        return {"phone": student.get("phone"), "messages": messages, "earlier": earlier}
 
 
 @app.post("/api/chat")
@@ -143,8 +146,8 @@ async def chat_send(request: Request):
         student = require_person(request, conn, "student")
         chat.turn(conn, student, text, "desk")
         conn.commit()
-        messages = chat.history(conn, student["id"])
-    return {"messages": messages}
+        messages, earlier = chat.history_page(conn, student["id"])
+    return {"messages": messages, "earlier": earlier}
 
 
 @app.get("/api/admin/whatsapp")
@@ -182,21 +185,34 @@ async def save_whatsapp_settings(request: Request):
 def grok_settings(request: Request):
     with db.connect() as conn:
         require_person(request, conn, "admin")
-        return {"key_set": bool(db.setting(conn, "grok_api_key"))}
+        return {
+            "key_set": bool(db.setting(conn, "grok_api_key")),
+            "gemini_key_set": bool(db.setting(conn, "gemini_api_key")),
+            "provider": "gemini" if db.setting(conn, "gemini_api_key") else "grok",
+        }
 
 
 @app.put("/api/admin/grok")
 async def save_grok_settings(request: Request):
     body = await request.json()
     key = str(body.get("api_key") or "").strip()
+    gemini = str(body.get("gemini_api_key") or "").strip()
     if key and len(key) < 12:
         raise HTTPException(400, "Paste the full Grok API key.")
+    if gemini and len(gemini) < 12:
+        raise HTTPException(400, "Paste the full Gemini API key.")
     with db.connect() as conn:
         require_person(request, conn, "admin")
         if key:
             db.save_setting(conn, "grok_api_key", key)
+        if gemini:
+            db.save_setting(conn, "gemini_api_key", gemini)
         conn.commit()
-        return {"key_set": bool(db.setting(conn, "grok_api_key"))}
+        return {
+            "key_set": bool(db.setting(conn, "grok_api_key")),
+            "gemini_key_set": bool(db.setting(conn, "gemini_api_key")),
+            "provider": "gemini" if db.setting(conn, "gemini_api_key") else "grok",
+        }
 
 
 @app.post("/api/session")

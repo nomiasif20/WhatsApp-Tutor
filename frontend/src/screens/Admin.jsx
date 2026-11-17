@@ -333,8 +333,9 @@ function WhatsAppLine() {
         <p className="kicker">Administrator</p>
         <h1>WhatsApp</h1>
         <p className="lede">
-          Students message the business number and receive the topic, a worked example, and similar questions.
-          Link each student number on their account. The desk chat uses the same replies.
+          A student messages the business WhatsApp number. The desk matches that phone to their account,
+          answers with the same tutor, and keeps the message in the student chat history. The reply goes back on WhatsApp.
+          Link the number on the student account, then give Meta this webhook on a public https address.
         </p>
       </div>
       {error ? <p className="bad">{error}</p> : null}
@@ -368,7 +369,9 @@ function WhatsAppLine() {
 function GrokKey() {
   const [ready, setReady] = useState(false);
   const [key, setKey] = useState("");
+  const [gemini, setGemini] = useState("");
   const [saved, setSaved] = useState(false);
+  const [geminiSaved, setGeminiSaved] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
@@ -376,6 +379,7 @@ function GrokKey() {
   useEffect(() => {
     api("/api/admin/grok").then((data) => {
       setSaved(Boolean(data.key_set));
+      setGeminiSaved(Boolean(data.gemini_key_set));
       setReady(true);
     }).catch((err) => setError(err.message));
   }, []);
@@ -386,10 +390,12 @@ function GrokKey() {
     setError("");
     setNotice("");
     try {
-      const data = await api("/api/admin/grok", { method: "PUT", json: { api_key: key } });
+      const data = await api("/api/admin/grok", { method: "PUT", json: { api_key: key, gemini_api_key: gemini } });
       setSaved(Boolean(data.key_set));
+      setGeminiSaved(Boolean(data.gemini_key_set));
       setKey("");
-      setNotice(data.key_set ? "Grok can reply to conversation in the chat." : "No key is saved yet.");
+      setGemini("");
+      setNotice(data.gemini_key_set ? "Conversation uses Gemini." : "Gemini is not saved yet. Chat can still use the backup key.");
     } catch (err) {
       setError(err.message);
     } finally {
@@ -401,15 +407,19 @@ function GrokKey() {
   return (
     <form className="panel stack" onSubmit={save}>
       <h2>Conversation</h2>
-      <p className="lede">Grok replies when a student is chatting rather than asking for a calculation. A sum such as add 2+3 is still answered from the curriculum.</p>
+      <p className="lede">Gemini replies when a student is chatting rather than asking for a calculation. A sum such as add 2+3 is still answered from the curriculum.</p>
       {error ? <p className="bad">{error}</p> : null}
       {notice ? <p>{notice}</p> : null}
-      <p>{saved ? "A key is saved. Conversation in the chat uses it." : "Add an xAI or Groq key before conversational replies can be sent."}</p>
+      <p>{geminiSaved ? "A Gemini key is saved. Conversation uses Gemini." : "Add a Gemini key before conversational replies use Gemini."}</p>
       <label className="field">
-        <span>Grok API key</span>
-        <input type="password" autoComplete="new-password" value={key} placeholder={saved ? "Saved. Enter a new key to replace it." : "xAI key, or a Groq key starting with gsk_"} onChange={(event) => setKey(event.target.value)} />
+        <span>Gemini API key</span>
+        <input type="password" autoComplete="new-password" value={gemini} placeholder={geminiSaved ? "Saved. Enter a new key to replace it." : "Key from Google AI Studio"} onChange={(event) => setGemini(event.target.value)} />
       </label>
-      <button className="primary" disabled={busy || !key.trim()}>{busy ? "Saving…" : "Save key"}</button>
+      <label className="field">
+        <span>Backup key</span>
+        <input type="password" autoComplete="new-password" value={key} placeholder={saved ? "A backup key is saved." : "Optional Groq or xAI key"} onChange={(event) => setKey(event.target.value)} />
+      </label>
+      <button className="primary" disabled={busy || (!key.trim() && !gemini.trim())}>{busy ? "Saving…" : "Save keys"}</button>
     </form>
   );
 }

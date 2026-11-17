@@ -47,6 +47,7 @@ function ClassView() {
           </button>
         ))}
       </div>
+      <div className="table-scroll">
       <table>
         <thead>
           <tr>
@@ -94,6 +95,7 @@ function ClassView() {
           })}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }
@@ -169,6 +171,7 @@ function Curriculum() {
       {message ? <p>{message}</p> : null}
       {error ? <p className="bad">{error}</p> : null}
       <div className="split">
+        <div className="table-scroll">
         <table>
           <thead>
             <tr><th>Document</th><th>Kind</th><th>Grade</th><th>Pages</th><th>Passages</th></tr>
@@ -185,6 +188,7 @@ function Curriculum() {
             ))}
           </tbody>
         </table>
+        </div>
         <form className="panel" onSubmit={upload}>
           <h2>Add a document</h2>
           <p>PDF files are read as text. For an image, describe what it teaches so the topic match can use it.</p>

@@ -12,22 +12,49 @@ import grok
 CURRENT_TERM = 4
 
 
-def history(conn, student_id: str, limit: int = 40) -> list[dict]:
-    rows = conn.execute(
-        """
-        SELECT id, direction, body, source, created_at
-          FROM (
+def history(conn, student_id: str, limit: int = 80, before: int | None = None) -> list[dict]:
+    if before:
+        rows = conn.execute(
+            """
             SELECT id, direction, body, source, created_at
-              FROM chat_messages
-             WHERE student_id = ?
-             ORDER BY id DESC
-             LIMIT ?
-          )
-         ORDER BY id ASC
-        """,
-        (student_id, limit),
-    ).fetchall()
+              FROM (
+                SELECT id, direction, body, source, created_at
+                  FROM chat_messages
+                 WHERE student_id = ? AND id < ?
+                 ORDER BY id DESC
+                 LIMIT ?
+              )
+             ORDER BY id ASC
+            """,
+            (student_id, before, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT id, direction, body, source, created_at
+              FROM (
+                SELECT id, direction, body, source, created_at
+                  FROM chat_messages
+                 WHERE student_id = ?
+                 ORDER BY id DESC
+                 LIMIT ?
+              )
+             ORDER BY id ASC
+            """,
+            (student_id, limit),
+        ).fetchall()
     return [dict(row) for row in rows]
+
+
+def history_page(conn, student_id: str, limit: int = 80, before: int | None = None) -> tuple[list[dict], int]:
+    rows = history(conn, student_id, limit=limit, before=before)
+    earlier = 0
+    if rows:
+        earlier = conn.execute(
+            "SELECT COUNT(*) AS n FROM chat_messages WHERE student_id = ? AND id < ?",
+            (student_id, rows[0]["id"]),
+        ).fetchone()["n"]
+    return rows, earlier
 
 
 def turn(conn, student: dict, text: str, source: str) -> list[str]:
@@ -371,10 +398,22 @@ def _looks_like_answer(text: str) -> bool:
 
 
 def _conversation(conn, student: dict, text: str, note: str = "") -> str:
-    recent = history(conn, student["id"], limit=8)
-    if recent and recent[-1]["direction"] == "in":
+    recent = history(conn, student["id"], limit=20)
+    if recent and recent[-1]["direction"] == "in" and recent[-1]["body"].strip() == text.strip():
         recent = recent[:-1]
-    return grok.reply(conn, student, text, recent, note)
+    return grok.reply(conn, student, text, [_brief(item) for item in recent], note)
+
+
+def _brief(item: dict) -> dict:
+    """Keep the conversation, and shorten a long worked example to its answer."""
+    body = item["body"].strip()
+    if item["direction"] == "out" and len(body) > 420:
+        first = body.splitlines()[0][:160]
+        found = re.search(r"Answer:\s*([^\n]+)", body)
+        body = f"{first}\nAnswer: {found.group(1).strip()[:80]}" if found else first
+    data = dict(item)
+    data["body"] = body[:600]
+    return data
 
 
 def _is_conversation(text: str) -> bool:
